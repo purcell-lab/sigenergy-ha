@@ -16,7 +16,13 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-from .api import SigenergyApi, SigenergyApiError, SigenergyAuthError, SigenergyRateLimitError
+from .api import (
+    SigenergyApi,
+    SigenergyApiError,
+    SigenergyAuthError,
+    SigenergyRateLimitError,
+    SigenergyTransientError,
+)
 from .const import (
     API_BASE_URL,
     AUTH_METHOD_KEY,
@@ -146,13 +152,26 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Could not connect to the Sigenergy API: {err}"
             ) from err
 
+    def _prev_system(self, system_id: str) -> dict[str, Any]:
+        """Return previous data for a system, or empty dict."""
+        if self.data:
+            return self.data.get("systems", {}).get(system_id, {})
+        return {}
+
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from the Sigenergy API."""
+        """Fetch data from the Sigenergy API.
+
+        On transient errors (rpc fail, station disconnect) the coordinator
+        keeps the last-known-good value for the affected section so that
+        sensors stay available instead of flipping to 'unavailable'.
+        """
         try:
             result: dict[str, Any] = {"systems": {}}
 
             for system in self.systems:
                 system_id = system["systemId"]
+                prev = self._prev_system(system_id)
+
                 system_data: dict[str, Any] = {
                     "info": system,
                     "summary": {},
@@ -161,11 +180,13 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "devices": {},
                 }
 
-                # Fetch system-level realtime data
+                # ── System-level realtime data ────────────────────
                 try:
                     system_data["summary"] = await self.api.get_realtime_summary(
                         system_id
                     )
+                except SigenergyTransientError:
+                    system_data["summary"] = prev.get("summary", {})
                 except SigenergyApiError as err:
                     _LOGGER.debug("Error fetching summary for %s: %s", system_id, err)
 
@@ -173,22 +194,27 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     system_data["energy_flow"] = await self.api.get_energy_flow(
                         system_id
                     )
+                except SigenergyTransientError:
+                    system_data["energy_flow"] = prev.get("energy_flow", {})
                 except SigenergyApiError as err:
                     _LOGGER.debug(
                         "Error fetching energy flow for %s: %s", system_id, err
                     )
 
-                # Fetch operating mode
+                # ── Operating mode ────────────────────────────────
                 try:
                     system_data["operating_mode"] = await self.api.get_operating_mode(
                         system_id
                     )
+                except SigenergyTransientError:
+                    system_data["operating_mode"] = prev.get("operating_mode")
                 except SigenergyApiError as err:
                     _LOGGER.debug(
                         "Error fetching operating mode for %s: %s", system_id, err
                     )
 
-                # Fetch device-level realtime data
+                # ── Device-level realtime data ────────────────────
+                prev_devices = prev.get("devices", {})
                 devices = self.devices.get(system_id, [])
                 for device in devices:
                     serial = device.get("serialNumber", "")
@@ -200,6 +226,9 @@ class SigenergyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "info": device,
                             "realtime": device_data.get("realTimeInfo", {}),
                         }
+                    except SigenergyTransientError:
+                        if serial in prev_devices:
+                            system_data["devices"][serial] = prev_devices[serial]
                     except SigenergyApiError as err:
                         _LOGGER.debug(
                             "Error fetching device %s data: %s", serial, err

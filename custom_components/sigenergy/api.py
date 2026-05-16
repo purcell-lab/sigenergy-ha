@@ -45,6 +45,14 @@ class SigenergyRateLimitError(SigenergyApiError):
     """Rate limit exceeded."""
 
 
+class SigenergyTransientError(SigenergyApiError):
+    """Transient communication error (e.g. rpc fail, station disconnect).
+
+    These are typically short-lived cloud-to-device hiccups and callers
+    should fall back to the last known-good data rather than blanking sensors.
+    """
+
+
 class SigenergyApi:
     """Client for the Sigenergy Cloud OpenAPI."""
 
@@ -173,6 +181,15 @@ class SigenergyApi:
         except aiohttp.ClientError as err:
             raise SigenergyApiError(f"Connection error: {err}") from err
 
+    # Error codes that indicate a transient cloud-to-device communication
+    # failure.  The data is temporarily unavailable but will likely return
+    # on the next poll, so callers should keep the last-known-good value.
+    TRANSIENT_ERROR_CODES = frozenset({
+        1001,   # rpc fail
+        1109,   # rpc fail (alternate code)
+        13008,  # station disconnect
+    })
+
     def _check_response(self, data: dict[str, Any], url: str) -> dict[str, Any]:
         """Check API response for errors."""
         code = data.get("code", -1)
@@ -182,6 +199,13 @@ class SigenergyApi:
             raise SigenergyRateLimitError("Access restriction")
         if code in (11002, 11003):
             raise SigenergyAuthError(data.get("msg", "Auth error"))
+        if code in self.TRANSIENT_ERROR_CODES:
+            msg = data.get("msg", "transient error")
+            _LOGGER.debug(
+                "Transient API error %s: %s (url=%s) — will use cached data",
+                code, msg, url,
+            )
+            raise SigenergyTransientError(msg, code=code)
         if code != 0:
             _LOGGER.warning("API error %s: %s (url=%s)", code, data.get("msg"), url)
         return data
